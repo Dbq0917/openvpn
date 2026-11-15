@@ -120,6 +120,11 @@ void free_context_buffers(struct context_buffers *b);
 #define ISC_ERRORS       (1 << 0)
 #define ISC_SERVER       (1 << 1)
 #define ISC_ROUTE_ERRORS (1 << 2)
+
+/* Maximum number of connection restarts triggered by incomplete
+ * route installation before giving up and running degraded. */
+#define ROUTE_REPAIR_MAX_ATTEMPTS 3
+
 void initialization_sequence_completed(struct context *c, const unsigned int flags);
 
 #ifdef ENABLE_MANAGEMENT

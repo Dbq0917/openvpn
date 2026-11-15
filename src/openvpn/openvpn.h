@@ -185,6 +185,19 @@ struct context_1
     /**< Hash of option strings received from the
      *   remote OpenVPN server.  Only used in
      *   client-mode. */
+
+    /* if client mode, hash of pulled option strings excluding the
+     * route-only options (route, route-ipv6, route-gateway,
+     * redirect-gateway, redirect-private).  If this hash is unchanged
+     * on reconnect while pulled_options_digest_save changed, only the
+     * pushed routes differ and they can be updated in place without
+     * reopening the tun/tap device. */
+    struct sha256_digest pulled_options_tun_digest_save;
+
+    /* number of consecutive reconnects triggered because the pushed
+     * routes could not be fully installed, reset once the
+     * initialization sequence completes with all routes in place */
+    unsigned int route_repair_attempts;
 };
 
 
@@ -414,6 +427,11 @@ struct context_2
     bool pulled_options_digest_init_done;
     md_ctx_t *pulled_options_state;
     struct sha256_digest pulled_options_digest;
+
+    /* same as above, but excluding route-only options, so a route-only
+     * change can be applied without reopening the tun/tap device */
+    md_ctx_t *pulled_options_tun_state;
+    struct sha256_digest pulled_options_tun_digest;
 
     struct event_timeout scheduled_exit;
     int scheduled_exit_signal;

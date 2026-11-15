@@ -76,9 +76,9 @@ static bool del_route_ipapi(const struct route_ipv4 *r, const struct tuntap *tt)
 
 #endif
 
-static void delete_route(struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags,
-                         const struct route_gateway_info *rgi, const struct env_set *es,
-                         openvpn_net_ctx_t *ctx);
+void delete_route(struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags,
+                  const struct route_gateway_info *rgi, const struct env_set *es,
+                  openvpn_net_ctx_t *ctx);
 
 static void get_bypass_addresses(struct route_bypass *rb, const unsigned int flags);
 
@@ -1209,6 +1209,227 @@ delete_routes_v6(struct route_ipv6_list *rl6, const struct tuntap *tt, unsigned 
     }
 }
 
+/*
+ * Return true if two IPv4 routes describe the same kernel route, i.e.
+ * the installed one can be kept instead of being replaced by the other.
+ */
+static bool
+route_ipv4_same(const struct route_ipv4 *a, const struct route_ipv4 *b)
+{
+    return a->network == b->network && a->netmask == b->netmask && a->gateway == b->gateway
+           && a->metric == b->metric && a->table_id == b->table_id
+           && (a->flags & RT_METRIC_DEFINED) == (b->flags & RT_METRIC_DEFINED);
+}
+
+static bool
+route_ipv6_same(const struct route_ipv6 *a, const struct route_ipv6 *b)
+{
+    return a->netbits == b->netbits && a->metric == b->metric && a->table_id == b->table_id
+           && memcmp(&a->network, &b->network, sizeof(a->network)) == 0
+           && memcmp(&a->gateway, &b->gateway, sizeof(a->gateway)) == 0;
+}
+
+/*
+ * Find a route in a route list.  With prefix_only set, any route
+ * covering the same destination matches, otherwise only an identical
+ * route does.
+ */
+static struct route_ipv4 *
+route_list_find_ipv4(struct route_list *rl, const struct route_ipv4 *r, bool prefix_only)
+{
+    struct route_ipv4 *e;
+    for (e = rl ? rl->routes : NULL; e; e = e->next)
+    {
+        if (e->network == r->network && e->netmask == r->netmask
+            && (prefix_only || route_ipv4_same(e, r)))
+        {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static struct route_ipv6 *
+route_list_find_ipv6(struct route_ipv6_list *rl6, const struct route_ipv6 *r6, bool prefix_only)
+{
+    struct route_ipv6 *e;
+    for (e = rl6 ? rl6->routes_ipv6 : NULL; e; e = e->next)
+    {
+        if (e->netbits == r6->netbits && memcmp(&e->network, &r6->network, sizeof(e->network)) == 0
+            && (prefix_only || route_ipv6_same(e, r6)))
+        {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Return true if both route lists request an equivalent redirect of
+ * the IPv4 default gateway, so an already installed redirect can be
+ * kept as-is.
+ */
+static bool
+route_redirect_same(const struct route_list *a, const struct route_list *b)
+{
+    return a->flags == b->flags && a->spec.flags == b->spec.flags
+           && a->spec.remote_host == b->spec.remote_host
+           && a->spec.remote_endpoint == b->spec.remote_endpoint
+           && a->spec.default_metric == b->spec.default_metric;
+}
+
+void
+replace_route_list(struct route_list *rl, struct route_list *new_rl)
+{
+    clear_route_list(rl);
+    *rl = *new_rl;
+    CLEAR(*new_rl);
+}
+
+void
+replace_route_ipv6_list(struct route_ipv6_list *rl6, struct route_ipv6_list *new_rl6)
+{
+    clear_route_ipv6_list(rl6);
+    *rl6 = *new_rl6;
+    CLEAR(*new_rl6);
+}
+
+bool
+reconcile_route_list(struct route_list *rl, struct route_list *new_rl, const struct tuntap *tt,
+                     unsigned int flags, const struct env_set *es, openvpn_net_ctx_t *ctx)
+{
+    bool ret = true;
+
+    /* redirect-gateway: keep an identical redirect in place, otherwise
+     * undo the old one before installing the new one */
+    const bool did_redirect = (rl->iflags & RL_DID_REDIRECT_DEFAULT_GATEWAY) != 0;
+    if (did_redirect && route_redirect_same(rl, new_rl))
+    {
+        /* transfer the bookkeeping of the redirect that is already
+         * installed, so it can be undone when the tunnel closes */
+        new_rl->iflags |= rl->iflags & (RL_DID_REDIRECT_DEFAULT_GATEWAY | RL_DID_LOCAL);
+        new_rl->rgi = rl->rgi;
+    }
+    else
+    {
+        if (did_redirect)
+        {
+            undo_redirect_default_route_to_vpn(rl, tt, flags, es, ctx);
+        }
+        ret = redirect_default_route_to_vpn(new_rl, tt, flags, es, ctx) && ret;
+    }
+
+    /* remove routes whose parameters changed, they are re-added with
+     * the new parameters below */
+    if (rl->iflags & RL_ROUTES_ADDED)
+    {
+        struct route_ipv4 *r;
+        for (r = rl->routes; r; r = r->next)
+        {
+            if (!route_list_find_ipv4(new_rl, r, false) && route_list_find_ipv4(new_rl, r, true))
+            {
+                delete_route(r, tt, flags, &rl->rgi, es, ctx);
+            }
+        }
+    }
+
+    /* install new routes before removing anything else, so that
+     * destinations routed into the tunnel by both the old and the new
+     * route set keep their route at all times */
+    {
+        struct route_ipv4 *r;
+        for (r = new_rl->routes; r; r = r->next)
+        {
+            if (route_list_find_ipv4(rl, r, false))
+            {
+                continue; /* identical route already installed */
+            }
+            if (flags & ROUTE_DELETE_FIRST)
+            {
+                delete_route(r, tt, flags, &new_rl->rgi, es, ctx);
+            }
+            ret = add_route(r, tt, flags, &new_rl->rgi, es, ctx) && ret;
+        }
+        new_rl->iflags |= RL_ROUTES_ADDED;
+    }
+
+    /* remove routes that are no longer part of the new route set */
+    if (rl->iflags & RL_ROUTES_ADDED)
+    {
+        struct route_ipv4 *r;
+        for (r = rl->routes; r; r = r->next)
+        {
+            if (!route_list_find_ipv4(new_rl, r, true))
+            {
+                delete_route(r, tt, flags, &rl->rgi, es, ctx);
+            }
+        }
+    }
+
+    /* replace the old list with the reconciled new one */
+    replace_route_list(rl, new_rl);
+
+    return ret;
+}
+
+bool
+reconcile_route_ipv6_list(struct route_ipv6_list *rl6, struct route_ipv6_list *new_rl6,
+                          const struct tuntap *tt, unsigned int flags, const struct env_set *es,
+                          openvpn_net_ctx_t *ctx)
+{
+    bool ret = true;
+
+    /* remove routes whose parameters changed, they are re-added with
+     * the new parameters below */
+    if (rl6->iflags & RL_ROUTES_ADDED)
+    {
+        struct route_ipv6 *r6;
+        for (r6 = rl6->routes_ipv6; r6; r6 = r6->next)
+        {
+            if (!route_list_find_ipv6(new_rl6, r6, false) && route_list_find_ipv6(new_rl6, r6, true))
+            {
+                delete_route_ipv6(r6, tt, es, ctx);
+            }
+        }
+    }
+
+    /* install new routes before removing anything else */
+    {
+        struct route_ipv6 *r6;
+        for (r6 = new_rl6->routes_ipv6; r6; r6 = r6->next)
+        {
+            if (route_list_find_ipv6(rl6, r6, false))
+            {
+                continue; /* identical route already installed */
+            }
+            if (flags & ROUTE_DELETE_FIRST)
+            {
+                delete_route_ipv6(r6, tt, es, ctx);
+            }
+            ret = add_route_ipv6(r6, tt, flags, es, ctx) && ret;
+        }
+        new_rl6->iflags |= RL_ROUTES_ADDED;
+    }
+
+    /* remove routes that are no longer part of the new route set */
+    if (rl6->iflags & RL_ROUTES_ADDED)
+    {
+        struct route_ipv6 *r6;
+        for (r6 = rl6->routes_ipv6; r6; r6 = r6->next)
+        {
+            if (!route_list_find_ipv6(new_rl6, r6, true))
+            {
+                delete_route_ipv6(r6, tt, es, ctx);
+            }
+        }
+    }
+
+    /* replace the old list with the reconciled new one */
+    replace_route_ipv6_list(rl6, new_rl6);
+
+    return ret;
+}
+
 #ifndef ENABLE_SMALL
 
 static const char *
@@ -1996,7 +2217,7 @@ done:
     return (status != RTA_ERROR);
 }
 
-static void
+void
 delete_route(struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags,
              const struct route_gateway_info *rgi, const struct env_set *es, openvpn_net_ctx_t *ctx)
 {

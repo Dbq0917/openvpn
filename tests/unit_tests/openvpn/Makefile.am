@@ -217,11 +217,16 @@ networking_testdriver_CFLAGS = \
 	-I$(top_srcdir)/include -I$(top_srcdir)/src/compat -I$(top_srcdir)/src/openvpn \
 	@TEST_CFLAGS@ $(OPTIONAL_CRYPTO_CFLAGS)
 networking_testdriver_LDFLAGS = @TEST_LDFLAGS@ -L$(top_srcdir)/src/openvpn \
+	-Wl,--wrap=net_route_v4_add \
+	-Wl,--wrap=net_route_v4_del \
+	-Wl,--wrap=net_route_v6_add \
+	-Wl,--wrap=net_route_v6_del \
 	$(OPTIONAL_CRYPTO_LIBS)
 networking_testdriver_SOURCES = test_networking.c mock_msg.c \
 	test_route.c test_route.h test_common.h \
 	mock_management.c \
 	$(top_srcdir)/src/compat/compat-strlcpy.c \
+	$(top_srcdir)/src/openvpn/argv.c \
 	$(top_srcdir)/src/openvpn/networking_sitnl.c \
 	$(top_srcdir)/src/openvpn/route.c \
 	$(top_srcdir)/src/openvpn/env_set.c \

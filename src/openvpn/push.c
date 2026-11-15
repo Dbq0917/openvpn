@@ -1094,7 +1094,7 @@ process_incoming_push_request(struct context *c)
 }
 
 static void
-push_update_digest(md_ctx_t *ctx, struct buffer *buf, const struct options *opt)
+push_update_digest(md_ctx_t *ctx, md_ctx_t *tun_ctx, struct buffer *buf, const struct options *opt)
 {
     char line[OPTION_PARM_SIZE];
     while (buf_parse(buf, ',', line, sizeof(line)))
@@ -1122,6 +1122,16 @@ push_update_digest(md_ctx_t *ctx, struct buffer *buf, const struct options *opt)
             continue;
         }
         md_ctx_update(ctx, (const uint8_t *)line, strlen(line) + 1);
+
+        /* route-only options are tracked separately: a change limited
+         * to those can be applied by reconciling the installed routes
+         * instead of closing and reopening the tun/tap device */
+        if (!strprefix(line, "route ") && !strprefix(line, "route-ipv6 ")
+            && !strprefix(line, "route-gateway ") && !strprefix(line, "redirect-gateway ")
+            && !strprefix(line, "redirect-private "))
+        {
+            md_ctx_update(tun_ctx, (const uint8_t *)line, strlen(line) + 1);
+        }
     }
 }
 
@@ -1138,12 +1148,15 @@ process_incoming_push_reply(struct context *c, uint64_t permission_mask,
         {
             c->c2.pulled_options_state = md_ctx_new();
             md_ctx_init(c->c2.pulled_options_state, "SHA256");
+            c->c2.pulled_options_tun_state = md_ctx_new();
+            md_ctx_init(c->c2.pulled_options_tun_state, "SHA256");
             c->c2.pulled_options_digest_init_done = true;
         }
         if (apply_push_options(c, &c->options, buf, permission_mask, option_types_found, c->c2.es,
                                false))
         {
-            push_update_digest(c->c2.pulled_options_state, &buf_orig, &c->options);
+            push_update_digest(c->c2.pulled_options_state, c->c2.pulled_options_tun_state,
+                               &buf_orig, &c->options);
             switch (c->options.push_continuation)
             {
                 case 0:
@@ -1152,6 +1165,11 @@ process_incoming_push_reply(struct context *c, uint64_t permission_mask,
                     md_ctx_cleanup(c->c2.pulled_options_state);
                     md_ctx_free(c->c2.pulled_options_state);
                     c->c2.pulled_options_state = NULL;
+                    md_ctx_final(c->c2.pulled_options_tun_state,
+                                 c->c2.pulled_options_tun_digest.digest);
+                    md_ctx_cleanup(c->c2.pulled_options_tun_state);
+                    md_ctx_free(c->c2.pulled_options_tun_state);
+                    c->c2.pulled_options_tun_state = NULL;
                     c->c2.pulled_options_digest_init_done = false;
                     ret = PUSH_MSG_REPLY;
                     break;

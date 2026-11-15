@@ -1522,6 +1522,36 @@ initialization_sequence_completed(struct context *c, const unsigned int flags)
         c->options.no_advance = true;
     }
 
+#if defined(_WIN32) || defined(ENABLE_SITNL)
+    /* Incomplete routing after (re)connect would silently send traffic
+     * through the local gateway.  Restart the connection to re-attempt
+     * the full route installation instead of running degraded, giving
+     * up after a few attempts.  Only done on platforms where route
+     * installation errors are reported reliably (trivial "already
+     * exists" errors are filtered out there). */
+    if (flags & ISC_ROUTE_ERRORS)
+    {
+        if (c->c1.route_repair_attempts < ROUTE_REPAIR_MAX_ATTEMPTS)
+        {
+            c->c1.route_repair_attempts++;
+            msg(M_WARN,
+                "WARNING: route installation incomplete, restarting connection to restore full routing (attempt %u/%u)",
+                c->c1.route_repair_attempts, ROUTE_REPAIR_MAX_ATTEMPTS);
+            register_signal(c->sig, SIGUSR1, "route-repair");
+        }
+        else
+        {
+            msg(M_WARN,
+                "WARNING: route installation still incomplete after %u attempts, continuing with incomplete routes",
+                ROUTE_REPAIR_MAX_ATTEMPTS);
+        }
+    }
+    else
+    {
+        c->c1.route_repair_attempts = 0;
+    }
+#endif
+
 #ifdef _WIN32
     fork_register_dns_action(c->c1.tuntap);
 #endif
@@ -1652,6 +1682,70 @@ do_route(const struct options *options, struct route_list *route_list,
         show_adapters(D_SHOW_NET | M_NOPREFIX);
     }
 #endif
+    return ret;
+}
+
+/*
+ * Update the installed routes to match the current options without
+ * tearing down the tun/tap device: routes that are unchanged keep
+ * forwarding traffic, new routes are installed before removed routes
+ * are deleted.  Used on restart when only the pushed routes changed,
+ * so existing connections are not interrupted and no traffic falls
+ * back to the local gateway while routes are being replaced.
+ */
+static bool
+do_route_reconcile(struct context *c)
+{
+    bool ret = true;
+    const unsigned int flags = ROUTE_OPTION_FLAGS(&c->options);
+    const bool noexec = route_noexec_enabled(&c->options, c->c1.tuntap);
+
+    ASSERT(c->c2.link_sockets[0]);
+    do_alloc_route_list(c);
+
+    if (c->c1.route_list)
+    {
+        struct route_list new_rl;
+        CLEAR(new_rl);
+        if (c->options.routes)
+        {
+            do_init_route_list(&c->options, &new_rl, &c->c2.link_sockets[0]->info, c->c2.es,
+                               &c->net_ctx);
+        }
+        if (noexec)
+        {
+            /* routes are not installed, update the bookkeeping only */
+            replace_route_list(c->c1.route_list, &new_rl);
+        }
+        else
+        {
+            ret = reconcile_route_list(c->c1.route_list, &new_rl, c->c1.tuntap, flags, c->c2.es,
+                                       &c->net_ctx)
+                  && ret;
+        }
+    }
+
+    if (c->c1.route_ipv6_list)
+    {
+        struct route_ipv6_list new_rl6;
+        CLEAR(new_rl6);
+        if (c->options.routes_ipv6)
+        {
+            do_init_route_ipv6_list(&c->options, &new_rl6, &c->c2.link_sockets[0]->info, c->c2.es,
+                                    &c->net_ctx);
+        }
+        if (noexec)
+        {
+            replace_route_ipv6_list(c->c1.route_ipv6_list, &new_rl6);
+        }
+        else
+        {
+            ret = reconcile_route_ipv6_list(c->c1.route_ipv6_list, &new_rl6, c->c1.tuntap, flags,
+                                            c->c2.es, &c->net_ctx)
+                  && ret;
+        }
+    }
+
     return ret;
 }
 
@@ -1932,6 +2026,29 @@ do_open_tun(struct context *c, unsigned int *error_flags)
 
         run_dns_up_down(true, &c->options, c->c1.tuntap, &c->persist.duri);
 
+#if defined(_WIN32) || defined(ENABLE_SITNL)
+        /* Re-assert the routes on restart: they may have been removed
+         * externally while the tunnel was down, and silently missing
+         * routes make traffic leak through the local gateway.  On this
+         * platform re-adding an existing route is detected and treated
+         * as success, so reinstalling the whole set is safe. */
+        if (!route_noexec_enabled(&c->options, c->c1.tuntap)
+            && (c->c1.route_list || c->c1.route_ipv6_list))
+        {
+            if (c->c1.route_list)
+            {
+                c->c1.route_list->iflags &= ~RL_ROUTES_ADDED;
+            }
+            if (c->c1.route_ipv6_list)
+            {
+                c->c1.route_ipv6_list->iflags &= ~RL_ROUTES_ADDED;
+            }
+            const bool status = add_routes(c->c1.route_list, c->c1.route_ipv6_list, c->c1.tuntap,
+                                           ROUTE_OPTION_FLAGS(&c->options), c->c2.es, &c->net_ctx);
+            *error_flags |= (status ? 0 : ISC_ROUTE_ERRORS);
+        }
+#endif
+
         /* run the up script if user specified --up-restart */
         if (c->options.up_restart)
         {
@@ -1984,6 +2101,7 @@ do_close_tun_simple(struct context *c)
     }
     c->c1.tuntap_owned = false;
     CLEAR(c->c1.pulled_options_digest_save);
+    CLEAR(c->c1.pulled_options_tun_digest_save);
 }
 
 static void
@@ -2331,25 +2449,46 @@ do_up(struct context *c, bool pulled_options, uint64_t option_types_found)
                 && options_hash_changed_or_zero(&c->c1.pulled_options_digest_save,
                                                 &c->c2.pulled_options_digest))
             {
-                /* if so, close tun, delete routes, then reinitialize tun and add routes */
-                msg(M_INFO,
-                    "NOTE: Pulled options changed on restart, will need to close and reopen TUN/TAP device.");
-
                 bool tt_dco_win = tuntap_is_dco_win(c->c1.tuntap);
-                do_close_tun(c, true);
 
-                if (tt_dco_win)
+                if (!tt_dco_win
+                    && !options_hash_changed_or_zero(&c->c1.pulled_options_tun_digest_save,
+                                                     &c->c2.pulled_options_tun_digest))
                 {
-                    msg(M_NONFATAL, "dco-win doesn't yet support reopening TUN device");
-                    /* prevent link_socket_close() from closing handle with WinSock API */
-                    c->c2.link_sockets[0]->sd = SOCKET_UNDEFINED;
-                    return false;
+                    /* Only the pushed routes changed: update them
+                     * make-before-break and keep the tun/tap device and
+                     * the unchanged routes in place, so existing
+                     * connections are not interrupted. */
+                    msg(M_INFO,
+                        "NOTE: Pulled routes changed on restart, updating routes without closing TUN/TAP device.");
+
+                    const bool status = do_route_reconcile(c);
+                    error_flags |= (status ? 0 : ISC_ROUTE_ERRORS);
+
+                    c->c1.pulled_options_digest_save = c->c2.pulled_options_digest;
+                    c->c1.pulled_options_tun_digest_save = c->c2.pulled_options_tun_digest;
                 }
                 else
                 {
-                    management_sleep(1);
-                    c->c2.did_open_tun = do_open_tun(c, &error_flags);
-                    update_time();
+                    /* if so, close tun, delete routes, then reinitialize tun and add routes */
+                    msg(M_INFO,
+                        "NOTE: Pulled options changed on restart, will need to close and reopen TUN/TAP device.");
+
+                    do_close_tun(c, true);
+
+                    if (tt_dco_win)
+                    {
+                        msg(M_NONFATAL, "dco-win doesn't yet support reopening TUN device");
+                        /* prevent link_socket_close() from closing handle with WinSock API */
+                        c->c2.link_sockets[0]->sd = SOCKET_UNDEFINED;
+                        return false;
+                    }
+                    else
+                    {
+                        management_sleep(1);
+                        c->c2.did_open_tun = do_open_tun(c, &error_flags);
+                        update_time();
+                    }
                 }
             }
         }
@@ -2403,6 +2542,7 @@ do_up(struct context *c, bool pulled_options, uint64_t option_types_found)
         if (c->c2.did_open_tun)
         {
             c->c1.pulled_options_digest_save = c->c2.pulled_options_digest;
+            c->c1.pulled_options_tun_digest_save = c->c2.pulled_options_tun_digest;
 
             /* if --route-delay was specified, start timer */
             if ((route_order(c->c1.tuntap) == ROUTE_AFTER_TUN) && c->options.route_delay_defined)
@@ -2481,6 +2621,7 @@ do_update(struct context *c, uint64_t option_types_found)
     }
 
     CLEAR(c->c1.pulled_options_digest_save);
+    CLEAR(c->c1.pulled_options_tun_digest_save);
 
     return true;
 }
@@ -3831,6 +3972,11 @@ do_close_tls(struct context *c)
     {
         md_ctx_cleanup(c->c2.pulled_options_state);
         md_ctx_free(c->c2.pulled_options_state);
+    }
+    if (c->c2.pulled_options_tun_state)
+    {
+        md_ctx_cleanup(c->c2.pulled_options_tun_state);
+        md_ctx_free(c->c2.pulled_options_tun_state);
     }
 
     tls_auth_standalone_free(c->c2.tls_auth_standalone);

@@ -311,6 +311,10 @@ bool add_route(struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags
                const struct route_gateway_info *rgi, const struct env_set *es,
                openvpn_net_ctx_t *ctx);
 
+void delete_route(struct route_ipv4 *r, const struct tuntap *tt, unsigned int flags,
+                  const struct route_gateway_info *rgi, const struct env_set *es,
+                  openvpn_net_ctx_t *ctx);
+
 void add_route_to_option_list(struct route_option_list *l, const char *network, const char *netmask,
                               const char *gateway, const char *metric, int table_id);
 
@@ -339,6 +343,35 @@ void delete_routes_v4(struct route_list *rl, const struct tuntap *tt, unsigned i
 
 void delete_routes_v6(struct route_ipv6_list *rl6, const struct tuntap *tt, unsigned int flags,
                       const struct env_set *es, openvpn_net_ctx_t *ctx);
+
+/**
+ * Reconcile the installed IPv4 routes with a new route list,
+ * make-before-break: routes present in both the installed and the new
+ * set are left untouched, routes only in the new set are added before
+ * routes only in the old set are removed.  On return the contents of
+ * @a rl are replaced by @a new_rl (ownership of the new list's
+ * allocations is transferred to @a rl and @a new_rl is cleared).
+ *
+ * @return false if any route could not be installed.
+ */
+bool reconcile_route_list(struct route_list *rl, struct route_list *new_rl, const struct tuntap *tt,
+                          unsigned int flags, const struct env_set *es, openvpn_net_ctx_t *ctx);
+
+/**
+ * IPv6 variant of reconcile_route_list().
+ */
+bool reconcile_route_ipv6_list(struct route_ipv6_list *rl6, struct route_ipv6_list *new_rl6,
+                               const struct tuntap *tt, unsigned int flags, const struct env_set *es,
+                               openvpn_net_ctx_t *ctx);
+
+/**
+ * Replace the contents of a route list with another one without
+ * touching any kernel routes, disposing of the old contents.  The
+ * source list is cleared and must not be used afterwards.
+ */
+void replace_route_list(struct route_list *rl, struct route_list *new_rl);
+
+void replace_route_ipv6_list(struct route_ipv6_list *rl6, struct route_ipv6_list *new_rl6);
 
 void setenv_routes(struct env_set *es, const struct route_list *rl);
 
